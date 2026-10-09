@@ -1,0 +1,28 @@
+{
+  "name": "@xenial/oc-goal",
+  "version": "0.1.0",
+  "description": "Persistent thread goals for OpenCode: get/create/update goal tools, token & wall-clock budget accounting, and automatic idle continuation — a port of codex's goal feature.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "verify": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
