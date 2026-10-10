@@ -68,8 +68,8 @@ export class GoalAccountingState {
   private currentTurnId: string | null = null;
   private interruptedTurnId: string | null = null;
   private readonly turns = new Map<string, TurnAccounting>();
-  /** Wall-clock baseline (ms epoch) for the currently-active goal. */
-  private wallClockBaselineMs = Date.now();
+  /** Monotonic elapsed-time baseline; system clock adjustments must not affect usage. */
+  private wallClockBaselineMs = performance.now();
   private wallClockActiveGoalId: string | null = null;
   private budgetLimitReportedGoalId: string | null = null;
   private executionFailureGoalId: string | null = null;
@@ -350,7 +350,7 @@ export class GoalAccountingState {
   }
 
   resetIdleProgressBaselineAndClearActiveGoal(): void {
-    this.wallClockBaselineMs = Date.now();
+    this.wallClockBaselineMs = performance.now();
     this.wallClockActiveGoalId = null;
     this.budgetLimitReportedGoalId = null;
   }
@@ -363,7 +363,7 @@ export class GoalAccountingState {
   }
 
   private wallClockDeltaSeconds(): number {
-    return Math.floor((Date.now() - this.wallClockBaselineMs) / 1000);
+    return Math.max(0, Math.floor((performance.now() - this.wallClockBaselineMs) / 1000));
   }
 
   private advanceWallClock(seconds: number): void {
@@ -373,14 +373,14 @@ export class GoalAccountingState {
 
   private markWallClockActive(goalId: string): void {
     if (this.wallClockActiveGoalId !== goalId) {
-      this.wallClockBaselineMs = Date.now();
+      this.wallClockBaselineMs = performance.now();
       this.wallClockActiveGoalId = goalId;
     }
   }
 
   private clearWallClockActive(): void {
     this.wallClockActiveGoalId = null;
-    this.wallClockBaselineMs = Date.now();
+    this.wallClockBaselineMs = performance.now();
   }
 }
 

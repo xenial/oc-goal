@@ -357,6 +357,9 @@ export class GoalRuntime {
     rt.stopped = rt.stopped || (goal !== null && goal.status !== "active");
     if (rt.stopped || rt.suppressed || rt.agent === "plan") rt.accounting.stopWallClock();
     await this.publish(sessionID);
+    // Terminal events are durable; session.idle is a separate live notification that
+    // may be missed after a provider failure. wait() still enforces the idle boundary.
+    this.requestContinuation(sessionID);
   }
 
   async event(event: { type: string; id?: string; data?: Record<string, unknown> }): Promise<void> {

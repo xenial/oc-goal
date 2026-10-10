@@ -143,6 +143,52 @@ test("failed step usage is charged before a transient execution error", async (t
   assert.equal(h.continuations().length, 2);
 });
 
+test("a truncated OpenAI stream resumes without a separate idle event", async (t) => {
+  const h = await harness(t);
+  await h.command("task"); const id = await h.start();
+  await h.emit("session.text.delta", { delta: "Partial response before the stream failed" });
+  const error = { type: "ProviderError", message: "OpenAI Chat stream ended without finish_reason" };
+  await h.emit("session.step.failed", { assistantMessageID: id, tokens: tokens(), error });
+  await h.emit("session.execution.failed", { error });
+  assert.equal(h.goal().status, "active");
+  assert.equal(h.goal().tokensUsed, 110);
+  assert.equal(h.continuations().length, 2);
+  await h.emit("session.idle");
+  assert.equal(h.continuations().length, 2, "a late idle event cannot enqueue another continuation");
+});
+
+test("successful goal work continues without a separate idle event", async (t) => {
+  const h = await harness(t);
+  await h.command("task"); await h.start(); await h.settle(); await h.shell(true);
+  await h.emit("session.execution.succeeded");
+  assert.equal(h.continuations().length, 2);
+});
+
+test("failure recovery waits for idle and respects input arriving before it", async (t) => {
+  const h = await harness(t);
+  await h.command("task"); await h.start();
+  let idle;
+  h.context.session.wait = () => new Promise((resolve) => { idle = resolve; });
+  await h.emit("session.execution.failed", { error: { type: "ProviderError", message: "OpenAI Chat stream ended without finish_reason" } });
+  assert.equal(h.continuations().length, 1);
+  assert.equal(typeof idle, "function");
+  await h.emit("session.inbox.enqueued", { inboxID: "user-1", item: { type: "user", payload: { text: "New request" }, delivery: "queue" } });
+  idle(); await flush();
+  assert.equal(h.continuations().length, 1);
+});
+
+test("repeated stream failures block and publish the status without idle events", async (t) => {
+  const h = await harness(t);
+  await h.command("task");
+  for (let i = 0; i < 3; i++) {
+    await h.start();
+    await h.emit("session.execution.failed", { error: { type: "ProviderError", message: "OpenAI Chat stream ended without finish_reason" } });
+    assert.equal(h.goal().status, i === 2 ? "blocked" : "active");
+  }
+  assert.equal(h.continuations().length, 3);
+  assert.equal(h.changes.at(-1).goalStatus, "blocked");
+});
+
 test("three repeated execution errors block, while quota errors stop immediately", async (t) => {
   const h = await harness(t);
   await h.command("task");
@@ -277,8 +323,8 @@ test("budget wrap-up in a separate execution is included in final usage", async 
 });
 
 test("plan mode stops the elapsed-time baseline as well as token charging", async (t) => {
-  let now = Date.now();
-  t.mock.method(Date, "now", () => now);
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
   const h = await harness(t);
   await h.emit("session.agent.selected", { agent: "plan" });
   await h.command("task");
@@ -287,6 +333,60 @@ test("plan mode stops the elapsed-time baseline as well as token charging", asyn
   assert.equal(h.goal().timeUsedSeconds, 0);
   await h.start("plan"); now += 10000; await h.settle(); await h.succeed();
   assert.equal(h.goal().timeUsedSeconds, 0);
+});
+
+test("elapsed time follows real duration despite system clock jumps and frequent updates", async (t) => {
+  let elapsed = 0, wallTime = Date.now();
+  t.mock.method(performance, "now", () => elapsed);
+  t.mock.method(Date, "now", () => wallTime);
+  const h = await harness(t);
+  await h.command("task"); await h.start();
+  for (let i = 0; i < 30; i++) {
+    elapsed += 100;
+    wallTime += 60_000;
+    if (i) await h.step();
+    await h.settle(tokens(1, 1), "tool-calls"); await h.shell(true);
+    await Promise.all([h.command("status"), h.tool("get_goal"), h.emit("session.idle")]);
+    assert.equal(h.goal().timeUsedSeconds, Math.floor(elapsed / 1000));
+  }
+  await h.emit("session.execution.succeeded");
+  assert.equal(h.goal().timeUsedSeconds, 3);
+  assert.equal(h.goal().tokensUsed, 60);
+  assert.match((await h.get()).status, / 3s$/);
+});
+
+test("queued timer ticks account each elapsed second once", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = await harness(t);
+  await h.command("task"); await h.start();
+  now = 30_000;
+  t.mock.timers.tick(30_000);
+  await flush();
+  assert.equal(h.goal().timeUsedSeconds, 30);
+  now += 1000;
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.equal(h.goal().timeUsedSeconds, 31);
+});
+
+test("paused time is excluded when a goal resumes", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const h = await harness(t);
+  await h.command("task"); await h.start();
+  now += 2500;
+  await h.command("pause");
+  await h.emit("session.execution.interrupted", { reason: "user" });
+  assert.equal(h.goal().timeUsedSeconds, 2);
+  now += 120_000;
+  await h.command("status");
+  assert.equal(h.goal().timeUsedSeconds, 2);
+  await h.command("resume"); await h.start();
+  now += 2000;
+  await h.command("status");
+  assert.equal(h.goal().timeUsedSeconds, 4);
 });
 
 test("authoritative active context allows the blocked audit and supersedes old objectives", async (t) => {
