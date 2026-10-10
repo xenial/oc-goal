@@ -46,7 +46,7 @@ export default Plugin.define({
       remove: (key) => ctx.storage.remove(key),
     });
     let emitChanged: (sessionID: string) => Promise<void> = async () => {};
-    const runtime = new GoalRuntime(store, ctx.session, opts, (id) => emitChanged(id), log);
+    const runtime = new GoalRuntime(store, ctx.session, opts, (id) => emitChanged(id), log, ctx.location);
     const handlers = new GoalToolHandlers(store, opts.maxGoalTokenBudget, {
       onGoalCreated: (goal) => runtime.goalCreated(goal),
       onGoalUpdated: (goal) => runtime.goalUpdated(goal),

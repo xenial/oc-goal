@@ -371,6 +371,68 @@ test("queued timer ticks account each elapsed second once", async (t) => {
   assert.equal(h.goal().timeUsedSeconds, 31);
 });
 
+test("ten loaded locations account a global session event only once", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const db = new Map(), location = { directory: "C:/test/owner" };
+  const owner = await harness(t, {}, { db, location });
+  const locations = [owner];
+  for (let i = 0; i < 9; i++) {
+    locations.push(await harness(t, {}, { db, location: { directory: `C:/test/other-${i}` }, sessionLocation: location }));
+  }
+  await owner.command("task"); await owner.start();
+  for (const h of locations.slice(1)) await h.emit("session.execution.started");
+  for (const h of locations) await h.emit("session.step.started", { assistantMessageID: "shared-step", agent: "build" });
+  now = 1000;
+  for (const h of locations) await h.emit("session.idle");
+  assert.equal(owner.goal().timeUsedSeconds, 1, "each loaded location must not add its own second");
+  for (const h of locations) await h.emit("session.step.ended", { assistantMessageID: "shared-step", tokens: tokens(), finish: "stop" });
+  assert.equal(owner.goal().tokensUsed, 110);
+  for (const h of locations) await h.emit("session.execution.succeeded");
+  assert.equal(locations.reduce((n, h) => n + h.continuations().length, 0), 2);
+  assert.ok(locations.slice(1).every((h) => h.changes.length === 0));
+});
+
+test("events without a location resolve session ownership before accounting", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const db = new Map(), location = { directory: "C:/test/owner" };
+  const owner = await harness(t, {}, { db, location });
+  const other = await harness(t, {}, { db, location: { directory: "C:/test/other" }, sessionLocation: location });
+  await owner.command("task"); await owner.start();
+  await other.emit("session.execution.started", {}, "s", null);
+  now = 1000;
+  await owner.emit("session.idle", {}, "s", null);
+  await other.emit("session.idle", {}, "s", null);
+  assert.equal(owner.goal().timeUsedSeconds, 1);
+  await other.emit("session.execution.interrupted", { reason: "user" }, "s", null);
+  await other.emit("session.deleted", {}, "s", null);
+  assert.equal(owner.goal().status, "active", "a foreign instance cannot pause or delete a goal");
+  assert.equal(other.changes.length, 0);
+});
+
+test("Windows location ownership accepts equivalent path spelling", async (t) => {
+  const h = await harness(t, {}, { location: { directory: "C:\\TEST\\PROJECT\\" } });
+  await h.command("task"); await h.start();
+  await h.emit("session.execution.interrupted", { reason: "user" }, "s", { directory: "c:/test/project" });
+  assert.equal(h.goal().status, "paused");
+});
+
+test("workspace identity distinguishes instances with the same directory", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const db = new Map(), location = { directory: "C:/test/project", workspaceID: "workspace-owner" };
+  const owner = await harness(t, {}, { db, location });
+  const other = await harness(t, {}, { db, location: { ...location, workspaceID: "workspace-other" }, sessionLocation: location });
+  await owner.command("task"); await owner.start();
+  await other.emit("session.execution.started");
+  now = 1000;
+  await owner.emit("session.idle"); await other.emit("session.idle");
+  assert.equal(owner.goal().timeUsedSeconds, 1);
+  await other.emit("session.deleted");
+  assert.equal(owner.goal().status, "active");
+});
+
 test("paused time is excluded when a goal resumes", async (t) => {
   let now = 0;
   t.mock.method(performance, "now", () => now);

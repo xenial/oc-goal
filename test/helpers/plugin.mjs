@@ -4,8 +4,10 @@ export const tokens = (input = 100, output = 10, read = 0, reasoning = 0, write 
 export const flush = async () => { for (let i = 0; i < 6; i++) await new Promise(setImmediate); };
 
 /** Exercise the shipped entrypoint with the installed SDK's event shapes. */
-export async function harness(t, options = {}) {
-  const db = new Map(), tools = new Map(), commands = new Map(), sent = [], changes = [], interrupts = [];
+export async function harness(t, options = {}, environment = {}) {
+  const db = environment.db ?? new Map(), tools = new Map(), commands = new Map(), sent = [], changes = [], interrupts = [];
+  const location = environment.location ?? { directory: "C:/test/project" };
+  const sessionLocation = environment.sessionLocation ?? location;
   let rpc, next, contextHook, closed = false, busy = false, waiters = [], queue = [], pendingInbox = [], seq = 0, stepID;
   let usage = tokens(0, 0);
   let selectedAgent = "build";
@@ -15,6 +17,7 @@ export async function harness(t, options = {}) {
     else queue.push(item);
   };
   const context = {
+    location,
     options,
     storage: {
       get: async (key) => structuredClone(db.get(key)),
@@ -29,7 +32,7 @@ export async function harness(t, options = {}) {
     } },
     session: {
       hook: async (_name, callback) => { contextHook = callback; return { dispose() {} }; },
-      get: async () => ({ agent: selectedAgent }),
+      get: async () => ({ agent: selectedAgent, location: sessionLocation }),
       wait: async () => { if (busy) await new Promise((resolve) => waiters.push(resolve)); },
       interrupt: async (input) => { interrupts.push(input); return { interrupted: busy }; },
       synthetic: async (input) => {
@@ -37,7 +40,7 @@ export async function harness(t, options = {}) {
         sent.push(input);
         const data = { sessionID: "s", inboxID: id, item: { type: "synthetic", delivery: input.delivery, payload: { text: input.text, metadata: input.metadata } } };
         pendingInbox.push(id);
-        enqueue({ type: "session.inbox.enqueued", data });
+        enqueue({ type: "session.inbox.enqueued", location: sessionLocation, data });
         return { id };
       },
     },
@@ -56,10 +59,10 @@ export async function harness(t, options = {}) {
   };
   const cleanup = await plugin.setup(context);
   t.after(async () => { await cleanup(); });
-  const emit = async (type, data = {}, sessionID = "s") => {
+  const emit = async (type, data = {}, sessionID = "s", eventLocation = sessionLocation) => {
     if (type === "session.execution.started") busy = true;
     if (type === "session.agent.selected") selectedAgent = data.agent;
-    await new Promise((resolve) => enqueue({ type, data: { sessionID, ...data } }, resolve));
+    await new Promise((resolve) => enqueue({ type, ...(eventLocation ? { location: eventLocation } : {}), data: { sessionID, ...data } }, resolve));
     if (type.startsWith("session.execution.") && type !== "session.execution.started") {
       busy = false;
       for (const resolve of waiters.splice(0)) resolve();

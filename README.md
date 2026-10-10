@@ -40,7 +40,7 @@ Pause and clear interrupt current execution. Resume starts a fresh failure audit
 
 The plugin follows Codex's goal statuses, tool contract, audit prompts, budget precedence, interruption behavior and continuation guards. OpenCode requires different wiring: usage comes from settled step events, persistence uses plugin key-value storage, steering uses the session inbox, and the footer uses Solid reactivity. It is an adaptation, not an identical implementation of Codex's app-server protocol. The explicit continuation cap and `/goal budget` controls are plugin additions.
 
-Mutations and accounting are serialized per session within the plugin process. The storage adapter has no transactional or cross-process compare-and-swap API, so separate processes sharing the same storage are outside that guarantee.
+OpenCode loads a plugin instance per location while sharing the event stream and plugin storage. Each oc-goal instance handles only its own directory and workspace's session events, so opening more locations cannot multiply elapsed time, token charges or continuation turns. Events without location metadata are checked against the session's location. Mutations and accounting are serialized per session within the owning instance. The storage adapter has no transactional or cross-process compare-and-swap API, so separate processes sharing the same storage are outside that guarantee.
 
 ## Install
 

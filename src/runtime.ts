@@ -1,6 +1,19 @@
 import { GoalAccountingState, type TokenUsageSnapshot } from "./accounting.js";
 import { GoalStore, ThreadGoalStatus, validateGoalBudget, validateThreadGoalObjective, type ThreadGoal } from "./store.js";
 import { budgetLimitPrompt, continuationPrompt, goalStatePrompt, objectiveUpdatedPrompt } from "./steering.js";
+import { resolve, win32 } from "node:path";
+
+export interface GoalLocation {
+  directory: string;
+  workspaceID?: string;
+}
+
+function locationDirectory(directory: string): string {
+  // Windows locations may arrive with either slash style and different casing.
+  return process.platform === "win32" || /^(?:[a-z]:[\\/]|\\\\)/i.test(directory)
+    ? win32.resolve(directory).replace(/\\/g, "/").toLowerCase()
+    : resolve(directory);
+}
 
 export interface GoalPluginOptions {
   enabled: boolean;
@@ -14,7 +27,7 @@ export interface GoalSession {
     metadata: { ocGoal: true; purpose: string; goalId?: string };
   }): Promise<{ id: string }>;
   wait(input: { sessionID: string }): Promise<void>;
-  get(input: { sessionID: string }): Promise<{ agent?: string }>;
+  get(input: { sessionID: string }): Promise<{ agent?: string; location: GoalLocation }>;
   interrupt(input: { sessionID: string }): Promise<{ interrupted: boolean }>;
 }
 
@@ -54,7 +67,13 @@ export class GoalRuntime {
     private readonly options: GoalPluginOptions,
     private readonly changed: (sessionID: string) => Promise<void>,
     private readonly log: (message: string) => void,
+    private readonly location: GoalLocation,
   ) {}
+
+  private ownsLocation(location: GoalLocation): boolean {
+    return locationDirectory(location.directory) === locationDirectory(this.location.directory)
+      && location.workspaceID === this.location.workspaceID;
+  }
 
   /** Commands, tools and events share this queue so accounting snapshots cannot race. */
   async exclusive<T>(sessionID: string, action: () => Promise<T>): Promise<T> {
@@ -362,10 +381,14 @@ export class GoalRuntime {
     this.requestContinuation(sessionID);
   }
 
-  async event(event: { type: string; id?: string; data?: Record<string, unknown> }): Promise<void> {
+  async event(event: { type: string; id?: string; location?: GoalLocation; data?: Record<string, unknown> }): Promise<void> {
     const data = event.data ?? {};
     const sessionID = data.sessionID;
     if (this.disposed || !this.options.enabled || typeof sessionID !== "string") return;
+    // The event stream and plugin storage are global, but setup() runs per location.
+    // Only the owning instance may charge usage or dispatch continuation for a session.
+    const location = event.location ?? (await this.session.get({ sessionID })).location;
+    if (!this.ownsLocation(location)) return;
     return this.exclusive(sessionID, async () => {
       const rt = this.runtime(sessionID);
       switch (event.type) {
