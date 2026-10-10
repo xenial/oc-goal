@@ -25,6 +25,7 @@ import {
 } from "./spec.js";
 import { budgetLimitPrompt, continuationPrompt, objectiveUpdatedPrompt } from "./steering.js";
 import { GoalToolHandlers, ToolError } from "./tool.js";
+import { goalRpc } from "./rpc.js";
 
 interface GoalPluginOptions {
   enabled: boolean;
@@ -100,6 +101,7 @@ export default Plugin.define({
         rt.stopped = false;
         rt.continuationCount = 0;
         rt.accounting.markCurrentTurnGoalActive(goal.goalId);
+        void pushStatus(goal.threadId);
       },
       onGoalUpdated(goal) {
         const rt = runtimeFor(goal.threadId);
@@ -107,8 +109,53 @@ export default Plugin.define({
           rt.stopped = true;
           rt.accounting.clearActiveGoal();
         }
+        void pushStatus(goal.threadId);
       },
     });
+
+    // -- status publishing for the TUI footer ----------------------------------
+    // The TUI plugin reads goal state over RPC and subscribes to `changed`
+    // events. We also keep a pre-rendered status string in storage as a cheap
+    // fallback and emit an event on every mutation.
+    function formatElapsed(seconds: number): string {
+      const s = Math.max(0, Math.floor(seconds));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      if (h > 0) return `${h}h${m}m`;
+      if (m > 0) return `${m}m${sec}s`;
+      return `${sec}s`;
+    }
+    function renderStatus(goal: ThreadGoal | null): string {
+      if (!goal) return "";
+      const time = formatElapsed(goal.timeUsedSeconds);
+      const budget =
+        goal.tokenBudget !== null
+          ? ` ${goal.tokensUsed}/${goal.tokenBudget}tok`
+          : ` ${goal.tokensUsed}tok`;
+      return `goal:${goal.status}${budget} ${time}`;
+    }
+    async function statusPayload(sessionID: string) {
+      const goal = await store.getThreadGoal(sessionID);
+      return {
+        sessionID,
+        status: renderStatus(goal),
+        objective: goal?.objective ?? null,
+        goalStatus: goal?.status ?? null,
+        tokensUsed: goal?.tokensUsed ?? null,
+        tokenBudget: goal?.tokenBudget ?? null,
+        timeUsedSeconds: goal?.timeUsedSeconds ?? null,
+      };
+    }
+    // Set after the RPC registration below; safe to call before.
+    let emitChanged: (sessionID: string) => Promise<void> = async () => {};
+    async function pushStatus(sessionID: string): Promise<void> {
+      try {
+        await emitChanged(sessionID);
+      } catch (err) {
+        log(`failed to push status for ${sessionID}: ${String(err)}`);
+      }
+    }
 
     // -- tools ---------------------------------------------------------------
     const reg = await ctx.tool.transform((editor) => {
@@ -216,6 +263,23 @@ export default Plugin.define({
       return { goal, flippedToBudgetLimited: flipped };
     }
 
+    // Send an internal, model-facing message without rendering the full text
+    // in the transcript. Synthetic messages display only their `description`.
+    async function sendInternal(
+      sessionID: string,
+      text: string,
+      description: string,
+      delivery?: "steer" | "queue",
+    ): Promise<void> {
+      await ctx.session.synthetic({
+        sessionID,
+        text,
+        description,
+        delivery: delivery ?? null,
+        metadata: { ocGoal: true },
+      } as never);
+    }
+
     async function continueIfIdle(sessionID: string): Promise<void> {
       if (!opts.enabled) return;
       const rt = runtimeFor(sessionID);
@@ -230,13 +294,12 @@ export default Plugin.define({
       }
       rt.continuationCount += 1;
       rt.currentTurnAutomatic = true;
-      const text = continuationPrompt(goal);
       try {
-        await ctx.session.prompt({
+        await sendInternal(
           sessionID,
-          text,
-          metadata: { ocGoalContinuation: true },
-        } as never);
+          continuationPrompt(goal),
+          "Continuing toward the active goal",
+        );
         log(`session=${sessionID} goal continuation #${rt.continuationCount} dispatched`);
       } catch (err) {
         rt.currentTurnAutomatic = false;
@@ -302,12 +365,13 @@ export default Plugin.define({
                   "keep_active",
                 );
                 if (res?.flippedToBudgetLimited) {
-                  await ctx.session.prompt({
+                  await sendInternal(
                     sessionID,
-                    text: budgetLimitPrompt(res.goal),
-                    delivery: "steer",
-                    metadata: { ocGoalSteering: true },
-                  } as never);
+                    budgetLimitPrompt(res.goal),
+                    "Goal reached its token budget",
+                    "steer",
+                  );
+                  void pushStatus(sessionID);
                   log(`session=${sessionID} goal budget_limited; steering injected`);
                 }
               }
@@ -350,6 +414,7 @@ export default Plugin.define({
                   }
                   rt.accounting.clearActiveGoal();
                   rt.stopped = true;
+                  void pushStatus(sessionID);
                 }
                 rt.accounting.finishTurn(rt.currentTurnId);
                 rt.currentTurnId = null;
@@ -370,6 +435,7 @@ export default Plugin.define({
                   idleSnap.expectedGoalId,
                 );
                 rt.accounting.markIdleProgressAccountedForStatus(idleSnap, "active", false);
+                void pushStatus(sessionID);
               }
               if (!rt.stopped) await continueIfIdle(sessionID);
               break;
@@ -381,94 +447,101 @@ export default Plugin.define({
       }
     })();
 
-    // -- user commands -----------------------------------------------------------
+    // -- goal command logic (shared by slash command + RPC) ---------------------
+    async function runGoalCommand(sessionID: string, argument: string): Promise<string> {
+      const arg = argument.trim();
+      const rt = runtimeFor(sessionID);
+
+      if (!arg || arg === "status") {
+        const goal = await store.getThreadGoal(sessionID);
+        if (!goal) return "No goal set for this session.";
+        return (
+          `Goal status: ${goal.status}\nObjective: ${goal.objective}\n` +
+          `Tokens: ${goal.tokensUsed}${goal.tokenBudget !== null ? ` / ${goal.tokenBudget}` : ""}\n` +
+          `Time: ${goal.timeUsedSeconds}s`
+        );
+      }
+
+      if (arg === "clear") {
+        await store.deleteThreadGoal(sessionID);
+        rt.stopped = true;
+        rt.accounting.clearActiveGoal();
+        void pushStatus(sessionID);
+        return "Goal cleared.";
+      }
+
+      if (arg === "pause") {
+        const goal = await store.pauseActiveThreadGoal(sessionID);
+        if (goal) {
+          rt.stopped = true;
+          rt.accounting.clearActiveGoal();
+          void pushStatus(sessionID);
+          return "Goal paused.";
+        }
+        return "No active goal to pause.";
+      }
+
+      if (arg === "resume") {
+        const goal = await store.updateThreadGoal(sessionID, { status: "active" });
+        if (goal && goal.status === "active") {
+          rt.stopped = false;
+          rt.continuationCount = 0;
+          rt.accounting.markIdleGoalActive(goal.goalId);
+          void pushStatus(sessionID);
+          await continueIfIdle(sessionID);
+          return "Goal resumed.";
+        }
+        const g = await store.getThreadGoal(sessionID);
+        return g ? `Goal is ${g.status}; cannot resume.` : "No goal to resume.";
+      }
+
+      // Otherwise treat the arg as a new objective (replace existing).
+      const existing = await store.getThreadGoal(sessionID);
+      const previousObjective = existing?.objective ?? null;
+      const goal = await store.replaceThreadGoal(sessionID, arg, "active", opts.maxGoalTokenBudget);
+      rt.stopped = false;
+      rt.continuationCount = 0;
+      rt.accounting.markIdleGoalActive(goal.goalId);
+      void pushStatus(sessionID);
+      // If a turn is running and the objective changed, inject steering.
+      if (previousObjective !== null && previousObjective !== goal.objective && rt.currentTurnId) {
+        await sendInternal(sessionID, objectiveUpdatedPrompt(goal), "Goal objective updated", "steer");
+      } else if (!rt.currentTurnId) {
+        await continueIfIdle(sessionID);
+      }
+      return `Goal set (${goal.status}): ${goal.objective}`;
+    }
+
+    // -- RPC for the TUI footer / slash command ---------------------------------
+    const rpcReg = await ctx.rpc.register(goalRpc, {
+      async get(rawInput) {
+        const input = rawInput as { sessionID: string };
+        return statusPayload(input.sessionID);
+      },
+      async command(rawInput) {
+        const input = rawInput as { sessionID: string; argument: string };
+        const message = await runGoalCommand(input.sessionID, input.argument);
+        return { message };
+      },
+    });
+    emitChanged = async (sessionID) => {
+      await rpcReg.events.emit("changed", await statusPayload(sessionID));
+    };
+
+    // -- user slash command (server-side; renders a compact reply) ---------------
     const cmdReg = await ctx.command.transform((editor) => {
       if (!opts.enabled) return;
       editor.add({
         name: "goal",
         description: "Manage this session's goal: /goal [objective] | status | clear | pause | resume",
         async execute(input) {
-          const sessionID = input.sessionID;
-          const arg = (input.prompt.text ?? "").trim();
-          const rt = runtimeFor(sessionID);
-
-          const reply = async (text: string) => {
-            await ctx.session.prompt({ sessionID, text, metadata: { ocGoalNotice: true } } as never);
-          };
-
-          if (!arg || arg === "status") {
-            const goal = await store.getThreadGoal(sessionID);
-            if (!goal) {
-              await reply("No goal set for this session.");
-              return;
-            }
-            await reply(
-              `Goal status: ${goal.status}\nObjective: ${goal.objective}\n` +
-                `Tokens: ${goal.tokensUsed}${goal.tokenBudget !== null ? ` / ${goal.tokenBudget}` : ""}\n` +
-                `Time: ${goal.timeUsedSeconds}s`,
-            );
-            return;
-          }
-
-          if (arg === "clear") {
-            await store.deleteThreadGoal(sessionID);
-            rt.stopped = true;
-            rt.accounting.clearActiveGoal();
-            await reply("Goal cleared.");
-            return;
-          }
-
-          if (arg === "pause") {
-            const goal = await store.pauseActiveThreadGoal(sessionID);
-            if (goal) {
-              rt.stopped = true;
-              rt.accounting.clearActiveGoal();
-              await reply("Goal paused.");
-            } else {
-              await reply("No active goal to pause.");
-            }
-            return;
-          }
-
-          if (arg === "resume") {
-            const goal = await store.updateThreadGoal(sessionID, { status: "active" });
-            if (goal && goal.status === "active") {
-              rt.stopped = false;
-              rt.continuationCount = 0;
-              rt.accounting.markIdleGoalActive(goal.goalId);
-              await reply("Goal resumed.");
-              await continueIfIdle(sessionID);
-            } else {
-              const g = await store.getThreadGoal(sessionID);
-              await reply(g ? `Goal is ${g.status}; cannot resume.` : "No goal to resume.");
-            }
-            return;
-          }
-
-          // Otherwise treat the arg as a new objective (replace existing).
-          const existing = await store.getThreadGoal(sessionID);
-          const previousObjective = existing?.objective ?? null;
-          const goal = await store.replaceThreadGoal(
-            sessionID,
-            arg,
-            "active",
-            opts.maxGoalTokenBudget,
-          );
-          rt.stopped = false;
-          rt.continuationCount = 0;
-          rt.accounting.markIdleGoalActive(goal.goalId);
-          await reply(`Goal set (${goal.status}): ${goal.objective}`);
-          // If a turn is running and the objective changed, inject steering.
-          if (previousObjective !== null && previousObjective !== goal.objective && rt.currentTurnId) {
-            await ctx.session.prompt({
-              sessionID,
-              text: objectiveUpdatedPrompt(goal),
-              delivery: "steer",
-              metadata: { ocGoalSteering: true },
-            } as never);
-          } else if (!rt.currentTurnId) {
-            await continueIfIdle(sessionID);
-          }
+          const message = await runGoalCommand(input.sessionID, input.prompt.text ?? "");
+          await ctx.session.synthetic({
+            sessionID: input.sessionID,
+            text: message,
+            description: message,
+            metadata: { ocGoal: true },
+          } as never);
         },
       });
     });
@@ -479,6 +552,7 @@ export default Plugin.define({
       controller.abort();
       void reg.dispose();
       void cmdReg.dispose();
+      void rpcReg.dispose();
     };
   },
 });
