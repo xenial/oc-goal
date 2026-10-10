@@ -1,11 +1,9 @@
 /**
  * Goal persistence & state-machine semantics.
  *
- * Faithful TypeScript port of codex's `codex-rs/state/src/runtime/goals.rs`
- * and `codex-rs/state/src/model/thread_goal.rs`. The SQL `UPDATE ... CASE`
- * statements are expressed as pure functions over an in-memory record; the
- * storage backing is injected (`StorageBackend`) so the plugin can bind it to
- * `ctx.storage` while tests use a `Map`.
+ * Codex's status and budget rules adapted to OpenCode's key-value storage.
+ * Each store serializes reads and mutations per session to preserve guarded
+ * read/check/write operations. This is not a cross-process storage lock.
  */
 
 export const MAX_THREAD_GOAL_OBJECTIVE_CHARS = 4_000;
@@ -43,7 +41,7 @@ export interface GoalUpdate {
   objective?: string | null;
   status?: ThreadGoalStatus | null;
   /** Outer presence = "update the budget field"; inner null = clear it. */
-  tokenBudget?: (number | null) | null;
+  tokenBudget?: number | null;
   /** Optimistic-concurrency guard: stale writers are rejected (return null). */
   expectedGoalId?: string | null;
 }
@@ -67,7 +65,7 @@ export interface StorageBackend {
 }
 
 export function validateThreadGoalObjective(value: string): string | null {
-  if (value.length === 0) return "goal objective must not be empty";
+  if (value.trim().length === 0) return "goal objective must not be empty";
   if ([...value].length > MAX_THREAD_GOAL_OBJECTIVE_CHARS) {
     return `goal objective must be at most ${MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters`;
   }
@@ -79,8 +77,8 @@ export function validateGoalBudget(
   value: number | null,
   maxGoalTokenBudget: number | null,
 ): string | null {
-  if (value !== null && value <= 0) {
-    return "goal budgets must be positive when provided";
+  if (value !== null && (!Number.isSafeInteger(value) || value <= 0)) {
+    return "goal budgets must be positive safe integers when provided";
   }
   if (value !== null && maxGoalTokenBudget !== null && value > maxGoalTokenBudget) {
     return `goal token budget ${value} exceeds the maximum allowed goal token budget of ${maxGoalTokenBudget}`;
@@ -88,14 +86,15 @@ export function validateGoalBudget(
   return null;
 }
 
-/** codex `goal_token_delta_for_usage`: input - cached + output. */
+/** OpenCode input/output exclude cache and reasoning; cache writes are uncached work. */
 export function goalTokenDeltaForUsage(usage: {
   input: number;
   output: number;
-  cache: { read: number };
+  reasoning?: number;
+  cache: { read: number; write?: number };
 }): number {
-  const nonCached = Math.max(0, usage.input - usage.cache.read);
-  return nonCached + Math.max(0, usage.output);
+  const positive = (n: number | undefined) => Number.isFinite(n) ? Math.max(0, n ?? 0) : 0;
+  return positive(usage.input) + positive(usage.output) + positive(usage.reasoning) + positive(usage.cache.write);
 }
 
 /** codex `status_after_budget_limit`. */
@@ -136,6 +135,7 @@ function newGoalId(): string {
 }
 
 export class GoalStore {
+  private readonly pending = new Map<string, Promise<void>>();
   constructor(
     private readonly backend: StorageBackend,
     private readonly keyPrefix = "goal:",
@@ -145,19 +145,34 @@ export class GoalStore {
     return `${this.keyPrefix}${threadId}`;
   }
 
+  /** Serialize the entire read/check/write, including deletes and guarded updates. */
+  private async exclusive<T>(threadId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.pending.get(threadId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.pending.set(threadId, current);
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
+      if (this.pending.get(threadId) === current) this.pending.delete(threadId);
+    }
+  }
+
   private async read(threadId: string): Promise<ThreadGoal | null> {
     const raw = await this.backend.get(this.key(threadId));
     if (raw === undefined || raw === null) return null;
-    return raw as ThreadGoal;
+    return structuredClone(raw as ThreadGoal);
   }
 
   private async write(goal: ThreadGoal): Promise<ThreadGoal> {
-    await this.backend.set(this.key(goal.threadId), goal as unknown as Record<string, unknown>);
-    return goal;
+    await this.backend.set(this.key(goal.threadId), structuredClone(goal));
+    return structuredClone(goal);
   }
 
   async getThreadGoal(threadId: string): Promise<ThreadGoal | null> {
-    return this.read(threadId);
+    return this.exclusive(threadId, () => this.read(threadId));
   }
 
   /**
@@ -170,6 +185,17 @@ export class GoalStore {
     status: ThreadGoalStatus,
     tokenBudget: number | null,
   ): Promise<ThreadGoal> {
+    return this.exclusive(threadId, () => this.replace(threadId, objective, status, tokenBudget));
+  }
+
+  private async replace(
+    threadId: string,
+    objective: string,
+    status: ThreadGoalStatus,
+    tokenBudget: number | null,
+  ): Promise<ThreadGoal> {
+    const error = validateThreadGoalObjective(objective);
+    if (error) throw new Error(error);
     const now = Date.now();
     const finalStatus = statusAfterBudgetLimit(status, 0, tokenBudget);
     const goal: ThreadGoal = {
@@ -197,9 +223,11 @@ export class GoalStore {
     status: ThreadGoalStatus,
     tokenBudget: number | null,
   ): Promise<ThreadGoal | null> {
-    const existing = await this.read(threadId);
-    if (existing !== null && existing.status !== "complete") return null;
-    return this.replaceThreadGoal(threadId, objective, status, tokenBudget);
+    return this.exclusive(threadId, async () => {
+      const existing = await this.read(threadId);
+      if (existing !== null && existing.status !== "complete") return null;
+      return this.replace(threadId, objective, status, tokenBudget);
+    });
   }
 
   /**
@@ -211,6 +239,10 @@ export class GoalStore {
    * Returns null when no goal exists or `expectedGoalId` does not match.
    */
   async updateThreadGoal(threadId: string, update: GoalUpdate): Promise<ThreadGoal | null> {
+    return this.exclusive(threadId, () => this.update(threadId, update));
+  }
+
+  private async update(threadId: string, update: GoalUpdate): Promise<ThreadGoal | null> {
     const goal = await this.read(threadId);
     if (goal === null) return null;
     if (
@@ -223,11 +255,13 @@ export class GoalStore {
 
     const next: ThreadGoal = { ...goal, updatedAtMs: Date.now() };
     if (update.objective !== null && update.objective !== undefined) {
+      const error = validateThreadGoalObjective(update.objective);
+      if (error) throw new Error(error);
       next.objective = update.objective;
     }
 
     const hasStatus = update.status !== null && update.status !== undefined;
-    const hasBudget = update.tokenBudget !== null && update.tokenBudget !== undefined;
+    const hasBudget = update.tokenBudget !== undefined;
     const newStatus = hasStatus ? (update.status as ThreadGoalStatus) : null;
     const newBudget = hasBudget ? (update.tokenBudget as number | null) : undefined;
 
@@ -278,21 +312,25 @@ export class GoalStore {
     threadId: string,
     status: ThreadGoalStatus,
   ): Promise<ThreadGoal | null> {
-    const goal = await this.read(threadId);
-    if (goal === null) return null;
-    const allowed =
-      goal.status === "active" ||
-      (status === "usage_limited" && goal.status === "budget_limited");
-    if (!allowed) return null;
-    return this.write({ ...goal, status, updatedAtMs: Date.now() });
+    return this.exclusive(threadId, async () => {
+      const goal = await this.read(threadId);
+      if (goal === null) return null;
+      const allowed =
+        goal.status === "active" ||
+        (status === "usage_limited" && goal.status === "budget_limited");
+      if (!allowed) return null;
+      return this.write({ ...goal, status, updatedAtMs: Date.now() });
+    });
   }
 
   /** codex `delete_thread_goal`. Returns the deleted goal, or null. */
   async deleteThreadGoal(threadId: string): Promise<ThreadGoal | null> {
-    const goal = await this.read(threadId);
-    if (goal === null) return null;
-    await this.backend.remove(this.key(threadId));
-    return goal;
+    return this.exclusive(threadId, async () => {
+      const goal = await this.read(threadId);
+      if (goal === null) return null;
+      await this.backend.remove(this.key(threadId));
+      return goal;
+    });
   }
 
   /**
@@ -308,6 +346,19 @@ export class GoalStore {
     mode: GoalAccountingMode,
     expectedGoalId: string | null = null,
   ): Promise<GoalAccountingOutcome> {
+    return this.exclusive(threadId, () => this.account(threadId, timeDeltaSeconds, tokenDelta, mode, expectedGoalId));
+  }
+
+  private async account(
+    threadId: string,
+    timeDeltaSeconds: number,
+    tokenDelta: number,
+    mode: GoalAccountingMode,
+    expectedGoalId: string | null,
+  ): Promise<GoalAccountingOutcome> {
+    if (!Number.isFinite(timeDeltaSeconds) || !Number.isFinite(tokenDelta)) {
+      throw new Error("goal usage deltas must be finite");
+    }
     const t = Math.max(0, Math.floor(timeDeltaSeconds));
     const tok = Math.max(0, Math.floor(tokenDelta));
     const current = await this.read(threadId);
@@ -346,10 +397,10 @@ export class GoalStore {
 export class MemoryStorageBackend implements StorageBackend {
   private readonly map = new Map<string, unknown>();
   async get(key: string): Promise<unknown> {
-    return this.map.get(key);
+    return structuredClone(this.map.get(key));
   }
   async set(key: string, value: unknown): Promise<void> {
-    this.map.set(key, value);
+    this.map.set(key, structuredClone(value));
   }
   async remove(key: string): Promise<void> {
     this.map.delete(key);

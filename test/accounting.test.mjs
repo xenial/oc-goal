@@ -5,14 +5,14 @@ import { GoalAccountingState, shouldClearActiveGoal, toolAttemptCountsForGoalPro
 const base = { input: 0, output: 0, cache: { read: 0, write: 0 } };
 const usage = (input, output, read = 0) => ({ input, output, cache: { read, write: 0 } });
 
-test("progress snapshot: token delta uses input-cached+output", () => {
+test("progress snapshot: OpenCode input is already uncached", () => {
   const a = new GoalAccountingState();
   a.startTurn("t1", true, usage(0, 0));
   a.markTurnGoalActive("t1", "g1");
   a.recordTokenUsage("t1", usage(1000, 250, 300));
   const snap = a.progressSnapshot("t1");
   assert.equal(snap.expectedGoalId, "g1");
-  assert.equal(snap.tokenDelta, 1000 - 300 + 250);
+  assert.equal(snap.tokenDelta, 1250);
 });
 
 test("no snapshot without an active goal", () => {
@@ -161,4 +161,15 @@ test("plan-mode turns do not account tokens", () => {
   a.markTurnGoalActive("t1", "g1");
   a.recordTokenUsage("t1", usage(1000, 500));
   assert.equal(a.progressSnapshot("t1"), null);
+});
+
+test("accounting a captured snapshot preserves usage observed after it", () => {
+  const a = new GoalAccountingState();
+  a.startTurn("t1", true);
+  a.markTurnGoalActive("t1", "g1");
+  a.recordTokenUsage("t1", usage(100, 10));
+  const snapshot = a.progressSnapshot("t1");
+  a.recordTokenUsage("t1", usage(200, 20));
+  a.markProgressAccountedForStatus("t1", snapshot, "active", false);
+  assert.equal(a.progressSnapshot("t1").tokenDelta, 110);
 });

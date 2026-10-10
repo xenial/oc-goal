@@ -105,7 +105,6 @@ export class GoalToolHandlers {
     const goal = await this.store.updateThreadGoal(threadId, {
       objective: null,
       status,
-      tokenBudget: null,
       expectedGoalId: null,
     });
     if (goal === null) throw new ToolError(NO_GOAL_ERROR);

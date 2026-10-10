@@ -11,6 +11,7 @@ import { goalTokenDeltaForUsage } from "./store.js";
 export interface TokenUsageSnapshot {
   input: number;
   output: number;
+  reasoning?: number;
   cache: { read: number; write: number };
 }
 
@@ -29,6 +30,7 @@ export interface GoalProgressSnapshot {
   expectedGoalId: string;
   timeDeltaSeconds: number;
   tokenDelta: number;
+  usage?: TokenUsageSnapshot;
 }
 
 interface TurnAccounting {
@@ -42,6 +44,7 @@ interface TurnAccounting {
   successfulTool: boolean;
   emptyFinal: boolean;
   hasActivity: boolean;
+  failureChecked: boolean;
 }
 
 function zeroUsage(): TokenUsageSnapshot {
@@ -52,7 +55,11 @@ function tokenDelta(last: TokenUsageSnapshot, current: TokenUsageSnapshot): numb
   const delta = {
     input: Math.max(0, current.input - last.input),
     output: Math.max(0, current.output - last.output),
-    cache: { read: Math.max(0, current.cache.read - last.cache.read), write: 0 },
+    reasoning: Math.max(0, (current.reasoning ?? 0) - (last.reasoning ?? 0)),
+    cache: {
+      read: Math.max(0, current.cache.read - last.cache.read),
+      write: Math.max(0, current.cache.write - last.cache.write),
+    },
   };
   return goalTokenDeltaForUsage(delta);
 }
@@ -71,6 +78,7 @@ export class GoalAccountingState {
   private consecutiveEmptyTurns = 0;
 
   startTurn(turnId: string, accountTokens: boolean, baseline?: TokenUsageSnapshot): void {
+    if (this.currentTurnId !== null) this.turns.delete(this.currentTurnId);
     if (this.interruptedTurnId !== null) {
       this.turns.delete(this.interruptedTurnId);
       this.interruptedTurnId = null;
@@ -87,6 +95,7 @@ export class GoalAccountingState {
       successfulTool: false,
       emptyFinal: false,
       hasActivity: false,
+      failureChecked: false,
     });
   }
 
@@ -99,9 +108,10 @@ export class GoalAccountingState {
   }
 
   recordToolOutcome(turnId: string, toolName: string, outcome: ToolOutcome): void {
-    this.consecutiveEmptyTurns = 0;
     const turn = this.turns.get(turnId);
     if (!turn) return;
+    if (!toolAttemptCountsForGoalProgress(outcome)) return;
+    this.consecutiveEmptyTurns = 0;
     turn.hasActivity = true;
     if (turn.activeGoalId === null) return;
 
@@ -110,8 +120,8 @@ export class GoalAccountingState {
       this.executionFailureGoalId = null;
       this.consecutiveExecutionFailureTurns = 0;
     } else if (
-      outcome.kind === "failed" &&
-      outcome.handlerExecuted &&
+      ((outcome.kind === "failed" && outcome.handlerExecuted) ||
+        (outcome.kind === "completed" && !outcome.success)) &&
       EXEC_TOOL_NAMES.has(toolName)
     ) {
       turn.failedExecution = true;
@@ -121,11 +131,16 @@ export class GoalAccountingState {
   /** Returns a goal id when the exec-failure threshold is reached. */
   executionFailureGoal(turnId: string): string | null {
     const turn = this.turns.get(turnId);
-    if (!turn) return null;
+    if (!turn || turn.failureChecked) return null;
+    turn.failureChecked = true;
     const goalId = turn.activeGoalId;
     if (goalId === null) return null;
     if (turn.successfulTool) return null;
-    if (!turn.failedExecution) return null;
+    if (!turn.failedExecution) {
+      this.executionFailureGoalId = null;
+      this.consecutiveExecutionFailureTurns = 0;
+      return null;
+    }
 
     if (this.executionFailureGoalId !== goalId) {
       this.executionFailureGoalId = goalId;
@@ -151,6 +166,17 @@ export class GoalAccountingState {
   resetEmptyResponses(): void {
     this.automaticGoalTurnId = null;
     this.consecutiveEmptyTurns = 0;
+  }
+
+  resetFailureResponses(): void {
+    this.resetEmptyResponses();
+    this.executionFailureGoalId = null;
+    this.consecutiveExecutionFailureTurns = 0;
+  }
+
+  /** Stop elapsed-time charging, retaining in-flight token attribution. */
+  stopWallClock(): void {
+    this.clearWallClockActive();
   }
 
   /** Returns a goal id when the empty-response threshold is reached. */
@@ -263,7 +289,12 @@ export class GoalAccountingState {
     const time =
       this.wallClockActiveGoalId === goalId ? this.wallClockDeltaSeconds() : 0;
     if (time === 0 && tok <= 0) return null;
-    return { expectedGoalId: goalId, timeDeltaSeconds: time, tokenDelta: tok };
+    return {
+      expectedGoalId: goalId,
+      timeDeltaSeconds: time,
+      tokenDelta: tok,
+      usage: { ...turn.current, cache: { ...turn.current.cache } },
+    };
   }
 
   /** Snapshot idle progress (wall clock while active, no in-turn tokens). */
@@ -284,7 +315,8 @@ export class GoalAccountingState {
   ): void {
     const turn = this.turns.get(turnId);
     if (turn) {
-      turn.lastAccounted = { ...turn.current, cache: { ...turn.current.cache } };
+      const usage = snapshot.usage ?? turn.current;
+      turn.lastAccounted = { ...usage, cache: { ...usage.cache } };
       if (clearActive) turn.activeGoalId = null;
     }
     this.advanceWallClock(snapshot.timeDeltaSeconds);

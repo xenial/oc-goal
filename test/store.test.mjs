@@ -245,17 +245,15 @@ test("usage accounting ignores replaced goal version", async () => {
   assert.equal(o.goal.tokensUsed, 0);
 });
 
-test("concurrent-ish usage accounting adds deltas", async () => {
+test("concurrent usage accounting preserves every delta", async () => {
   const s = newStore();
   await s.replaceThreadGoal(T, "count every token", "active", 1000);
   const a = s.accountThreadGoalUsage(T, 4, 40, "active_only", null);
   const b = s.accountThreadGoalUsage(T, 6, 60, "active_only", null);
   await Promise.all([a, b]);
   const g = await s.getThreadGoal(T);
-  // Both should apply; last writer wins per-field but both deltas accumulate
-  // because each reads-modify-writes. With an in-memory backend the two reads
-  // may race; assert the total is at least the larger delta.
-  assert.ok(g.tokensUsed >= 60);
+  assert.equal(g.tokensUsed, 100);
+  assert.equal(g.timeUsedSeconds, 10);
 });
 
 // --- validation & token delta ---
@@ -274,7 +272,48 @@ test("validateGoalBudget", () => {
   assert.equal(validateGoalBudget(50, 100), null);
 });
 
-test("goalTokenDeltaForUsage = input - cached + output", () => {
-  const d = goalTokenDeltaForUsage({ input: 1000, output: 250, cache: { read: 300 } });
-  assert.equal(d, 1000 - 300 + 250);
+test("OpenCode accounting includes reasoning and cache writes, excludes cache reads", () => {
+  const d = goalTokenDeltaForUsage({ input: 1000, output: 250, reasoning: 200, cache: { read: 300, write: 100 } });
+  assert.equal(d, 1550);
+});
+
+test("concurrent creates only insert one unfinished goal", async () => {
+  const s = newStore();
+  const results = await Promise.all([
+    s.insertThreadGoal(T, "first", "active", null),
+    s.insertThreadGoal(T, "second", "active", null),
+  ]);
+  assert.equal(results.filter(Boolean).length, 1);
+});
+
+test("an explicit null budget clears it, omission preserves it", async () => {
+  const s = newStore();
+  await s.replaceThreadGoal(T, "task", "active", 100);
+  assert.equal((await s.updateThreadGoal(T, { status: "paused" })).tokenBudget, 100);
+  assert.equal((await s.updateThreadGoal(T, { tokenBudget: null })).tokenBudget, null);
+});
+
+test("replacement wins over older accounting and cannot be resurrected by stale writers", async () => {
+  const s = newStore();
+  const old = await s.replaceThreadGoal(T, "old", "active", 100);
+  await Promise.all([
+    s.accountThreadGoalUsage(T, 1, 20, "active_only", old.goalId),
+    s.replaceThreadGoal(T, "new", "active", 200),
+    s.updateThreadGoal(T, { status: "complete", expectedGoalId: old.goalId }),
+  ]);
+  const goal = await s.getThreadGoal(T);
+  assert.equal(goal.objective, "new");
+  assert.equal(goal.tokensUsed, 0);
+  assert.equal(goal.status, "active");
+});
+
+test("cleared state cannot be resurrected by earlier accounting", async () => {
+  const s = newStore();
+  await s.replaceThreadGoal(T, "task", "active", null);
+  await Promise.all([s.accountThreadGoalUsage(T, 1, 20, "active_only"), s.deleteThreadGoal(T)]);
+  assert.equal(await s.getThreadGoal(T), null);
+});
+
+test("goal budget validation rejects non-finite, fractional and unsafe values", () => {
+  for (const value of [NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1]) assert.ok(validateGoalBudget(value, null));
 });

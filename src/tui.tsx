@@ -6,7 +6,8 @@
  */
 
 import { Plugin } from "@opencode/plugin/tui";
-import { createSignal, onCleanup, Show } from "solid-js";
+import { createSignal, createEffect, createComponent, Show } from "solid-js";
+import { jsx } from "@opentui/solid/jsx-runtime";
 import { goalRpc, type GoalStatusPayload } from "./rpc.js";
 
 const EMPTY = (sessionID: string): GoalStatusPayload => ({
@@ -22,20 +23,30 @@ const EMPTY = (sessionID: string): GoalStatusPayload => ({
 export default Plugin.define({
   id: "oc-goal",
   setup(ctx) {
+    if (ctx.options.enabled === false) return;
     const rpc = ctx.client.rpc(goalRpc);
+    let disposed = false;
+    const versions = new Map<string, number>();
+    const requests = new Map<string, number>();
 
     // Reactive per-session goal status, fed by an initial fetch + live events.
     const [goalBySession, setGoalBySession] = createSignal<Record<string, GoalStatusPayload>>({});
 
     function applyPayload(payload: GoalStatusPayload): void {
+      if (disposed) return;
+      versions.set(payload.sessionID, (versions.get(payload.sessionID) ?? 0) + 1);
       setGoalBySession((prev) => ({ ...prev, [payload.sessionID]: payload }));
     }
 
     async function refresh(sessionID: string): Promise<void> {
+      const version = versions.get(sessionID) ?? 0;
+      const request = (requests.get(sessionID) ?? 0) + 1;
+      requests.set(sessionID, request);
       try {
-        applyPayload((await rpc.get({ sessionID })) as unknown as GoalStatusPayload);
+        const payload = (await rpc.get({ sessionID })) as unknown as GoalStatusPayload;
+        if (version === (versions.get(sessionID) ?? 0) && requests.get(sessionID) === request) applyPayload(payload);
       } catch {
-        applyPayload(EMPTY(sessionID));
+        if (!goalBySession()[sessionID] && requests.get(sessionID) === request) applyPayload(EMPTY(sessionID));
       }
     }
 
@@ -49,13 +60,22 @@ export default Plugin.define({
     const disposeSlot = ctx.ui.slot({
       append: "prompt.footer.status",
       render: (input) => {
-        const sessionID = (input as { sessionID?: string }).sessionID;
-        if (sessionID) void refresh(sessionID);
-        return (
-          <Show when={sessionID && goalBySession()[sessionID]?.status}>
-            <text fg={ctx.theme.text.muted}>{sessionID ? goalBySession()[sessionID]?.status : ""}</text>
-          </Show>
-        );
+        const status = () => input.sessionID ? goalBySession()[input.sessionID]?.status : "";
+        createEffect(() => {
+          const sessionID = input.sessionID;
+          if (sessionID) void refresh(sessionID);
+        });
+        // Explicit getters preserve Solid reactivity in tsc's shipped JS output.
+        return createComponent(Show, {
+          keyed: true,
+          get when() { return status(); },
+          get children() {
+            return jsx("text", {
+              get fg() { return ctx.theme.text.muted; },
+              get children() { return status(); },
+            });
+          },
+        });
       },
     });
 
@@ -92,6 +112,7 @@ export default Plugin.define({
     }));
 
     return () => {
+      disposed = true;
       unsubscribe();
       disposeSlot();
     };
