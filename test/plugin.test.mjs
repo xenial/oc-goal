@@ -433,6 +433,146 @@ test("workspace identity distinguishes instances with the same directory", async
   assert.equal(owner.goal().status, "active");
 });
 
+test("overlapping reloads keep one timer and preserve unsettled execution usage", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const db = new Map(), location = { directory: "C:/test/reload" };
+  const original = await harness(t, {}, { db, location });
+  await original.command("task"); await original.start();
+  const instances = [original];
+  for (let i = 0; i < 9; i++) {
+    now += 1000;
+    t.mock.timers.tick(1000); await flush();
+    assert.equal(original.goal().timeUsedSeconds, i + 1);
+    // A fresh module evaluation models OpenCode invalidating the import cache.
+    const { default: reloaded } = await import(`../dist/index.js?reload-test=${i}`);
+    instances.push(await harness(t, {}, { db, location, plugin: reloaded }));
+  }
+  assert.ok(instances.slice(0, -1).every((h) => h.closed()));
+  const current = instances.at(-1);
+  now += 1000;
+  t.mock.timers.tick(1000); await flush();
+  assert.equal(current.goal().timeUsedSeconds, 10);
+  await current.emit("session.step.ended", { assistantMessageID: "step-2", tokens: tokens(), finish: "stop" });
+  assert.equal(current.goal().tokensUsed, 110, "the request started before reload must still settle");
+  for (const h of instances.slice(0, -1)) await h.cleanup();
+  now += 1000;
+  t.mock.timers.tick(1000); await flush();
+  assert.equal(current.goal().timeUsedSeconds, 11, "late finalizers must not retire the replacement");
+  await current.emit("session.execution.failed", { error: { message: "OpenAI Chat stream ended without finish_reason" } });
+  assert.equal(current.continuations().length, 1);
+});
+
+test("an overlapping setup that finishes late cannot start another timer", async (t) => {
+  let now = 0, registered, finishRegistration;
+  t.mock.method(performance, "now", () => now);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const db = new Map(), location = { directory: "C:/test/overlapping-setup" };
+  const ready = new Promise((resolve) => { registered = resolve; });
+  const gate = new Promise((resolve) => { finishRegistration = resolve; });
+  const pending = harness(t, {}, { db, location, registerTools: () => { registered(); return gate; } });
+  await ready;
+  const current = await harness(t, {}, { db, location });
+  await current.command("task"); await current.start();
+  finishRegistration();
+  const stale = await pending;
+  now = 5000;
+  t.mock.timers.tick(5000); await flush();
+  assert.equal(current.goal().timeUsedSeconds, 5);
+  assert.equal(stale.changes.length, 0);
+  await stale.cleanup(); await stale.cleanup();
+  now = 6000;
+  t.mock.timers.tick(1000); await flush();
+  assert.equal(current.goal().timeUsedSeconds, 6);
+});
+
+test("a disabled replacement stops the prior enabled instance", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const db = new Map(), location = { directory: "C:/test/disabled-reload" };
+  const original = await harness(t, {}, { db, location });
+  await original.command("task"); await original.start();
+  await harness(t, { enabled: false }, { db, location });
+  now = 5000;
+  t.mock.timers.tick(5000); await flush();
+  assert.ok(original.closed());
+  assert.equal(original.goal().timeUsedSeconds, 0);
+  const enabled = await harness(t, {}, { db, location });
+  now = 6000;
+  t.mock.timers.tick(1000); await flush();
+  assert.equal(enabled.goal().timeUsedSeconds, 0, "disabled time must not be charged on re-enable");
+  await enabled.start();
+  now = 7000;
+  t.mock.timers.tick(1000); await flush();
+  assert.equal(enabled.goal().timeUsedSeconds, 1);
+});
+
+test("reload recovers a pending idle check without letting the old waiter dispatch", async (t) => {
+  let oldReady, newReady;
+  const oldIdle = new Promise((resolve) => { oldReady = resolve; });
+  const newIdle = new Promise((resolve) => { newReady = resolve; });
+  const db = new Map(), location = { directory: "C:/test/reload-idle-check" };
+  const original = await harness(t, {}, { db, location, wait: () => oldIdle });
+  await original.command("task");
+  const current = await harness(t, {}, { db, location, wait: () => newIdle });
+  oldReady(); await flush();
+  assert.equal(original.continuations().length, 0);
+  assert.equal(current.continuations().length, 0);
+  newReady(); await flush();
+  assert.equal(current.continuations().length, 1);
+});
+
+test("a timer write already in flight during reload is accounted once", async (t) => {
+  let now = 0, reading, finishRead;
+  t.mock.method(performance, "now", () => now);
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const db = new Map(), location = { directory: "C:/test/reload-in-flight" };
+  const original = await harness(t, {}, { db, location });
+  await original.command("task"); await original.start();
+  const get = original.context.storage.get;
+  const ready = new Promise((resolve) => { reading = resolve; });
+  const gate = new Promise((resolve) => { finishRead = resolve; });
+  let delay = true;
+  original.context.storage.get = async (key) => {
+    if (delay) { delay = false; reading(); await gate; }
+    return get(key);
+  };
+  now = 1000;
+  t.mock.timers.tick(1000); await ready;
+  const current = await harness(t, {}, { db, location });
+  finishRead(); await flush();
+  assert.equal(current.goal().timeUsedSeconds, 1);
+  now = 2000;
+  t.mock.timers.tick(1000); await flush();
+  assert.equal(current.goal().timeUsedSeconds, 2);
+});
+
+test("a failure already in flight at takeover still resumes through the replacement", async (t) => {
+  let now = 0, reading, finishRead;
+  t.mock.method(performance, "now", () => now);
+  const db = new Map(), location = { directory: "C:/test/reload-terminal" };
+  const original = await harness(t, {}, { db, location });
+  await original.command("task"); await original.start();
+  const get = original.context.storage.get;
+  const ready = new Promise((resolve) => { reading = resolve; });
+  const gate = new Promise((resolve) => { finishRead = resolve; });
+  let delay = true;
+  original.context.storage.get = async (key) => {
+    if (delay) { delay = false; reading(); await gate; }
+    return get(key);
+  };
+  now = 1000;
+  const failure = original.emit("session.execution.failed", { error: { message: "OpenAI Chat stream ended without finish_reason" } });
+  await ready;
+  const current = await harness(t, {}, { db, location });
+  finishRead(); await failure; await flush();
+  assert.equal(current.goal().timeUsedSeconds, 1);
+  assert.equal(original.continuations().length, 1, "only the original initial continuation was sent");
+  assert.equal(current.continuations().length, 1, "the replacement recovers the terminal boundary");
+});
+
 test("paused time is excluded when a goal resumes", async (t) => {
   let now = 0;
   t.mock.method(performance, "now", () => now);

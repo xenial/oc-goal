@@ -24,7 +24,11 @@ export async function harness(t, options = {}, environment = {}) {
       set: async (key, value) => db.set(key, structuredClone(value)),
       remove: async (key) => db.delete(key),
     },
-    tool: { transform: async (cb) => { cb({ add: (tool) => tools.set(tool.name, tool) }); return { dispose() {} }; } },
+    tool: { transform: async (cb) => {
+      cb({ add: (tool) => tools.set(tool.name, tool) });
+      await environment.registerTools?.();
+      return { dispose() {} };
+    } },
     command: { transform: async (cb) => { cb({ add: (command) => commands.set(command.name, command) }); return { dispose() {} }; } },
     rpc: { register: async (_contract, handlers) => {
       rpc = handlers;
@@ -33,7 +37,10 @@ export async function harness(t, options = {}, environment = {}) {
     session: {
       hook: async (_name, callback) => { contextHook = callback; return { dispose() {} }; },
       get: async () => ({ agent: selectedAgent, location: sessionLocation }),
-      wait: async () => { if (busy) await new Promise((resolve) => waiters.push(resolve)); },
+      wait: async () => {
+        if (environment.wait) return environment.wait();
+        if (busy) await new Promise((resolve) => waiters.push(resolve));
+      },
       interrupt: async (input) => { interrupts.push(input); return { interrupted: busy }; },
       synthetic: async (input) => {
         const id = `input-${++seq}`;
@@ -57,9 +64,10 @@ export async function harness(t, options = {}, environment = {}) {
       } finally { signal.removeEventListener("abort", abort); }
     } },
   };
-  const cleanup = await plugin.setup(context);
+  const cleanup = await (environment.plugin ?? plugin).setup(context);
   t.after(async () => { await cleanup(); });
   const emit = async (type, data = {}, sessionID = "s", eventLocation = sessionLocation) => {
+    if (closed) return flush();
     if (type === "session.execution.started") busy = true;
     if (type === "session.agent.selected") selectedAgent = data.agent;
     await new Promise((resolve) => enqueue({ type, ...(eventLocation ? { location: eventLocation } : {}), data: { sessionID, ...data } }, resolve));
@@ -75,7 +83,7 @@ export async function harness(t, options = {}, environment = {}) {
     return stepID;
   };
   return {
-    db, tools, commands, sent, changes, interrupts, emit, context,
+    db, tools, commands, sent, changes, interrupts, emit, context, cleanup, closed: () => closed,
     goal: (id = "s") => structuredClone(db.get(`goal:${id}`)),
     continuations: () => sent.filter((m) => m.metadata.purpose === "continuation"),
     command: async (argument, sessionID = "s") => { const result = await rpc.command({ sessionID, argument }); await flush(); return result; },

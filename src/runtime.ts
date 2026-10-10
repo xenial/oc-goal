@@ -15,6 +15,10 @@ function locationDirectory(directory: string): string {
     : resolve(directory);
 }
 
+export function goalLocationKey(location: GoalLocation): string {
+  return JSON.stringify([locationDirectory(location.directory), location.workspaceID ?? null]);
+}
+
 export interface GoalPluginOptions {
   enabled: boolean;
   maxGoalTokenBudget: number | null;
@@ -56,9 +60,14 @@ interface SessionRuntime {
 
 const zeroUsage = (): TokenUsageSnapshot => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } });
 
+export interface GoalRuntimeState {
+  sessions: Map<string, SessionRuntime>;
+  pending: Map<string, Promise<void>>;
+}
+
 export class GoalRuntime {
-  private readonly sessions = new Map<string, SessionRuntime>();
-  private readonly pending = new Map<string, Promise<void>>();
+  private readonly sessions: GoalRuntimeState["sessions"];
+  private readonly pending: GoalRuntimeState["pending"];
   private disposed = false;
 
   constructor(
@@ -68,11 +77,23 @@ export class GoalRuntime {
     private readonly changed: (sessionID: string) => Promise<void>,
     private readonly log: (message: string) => void,
     private readonly location: GoalLocation,
-  ) {}
+    readonly state: GoalRuntimeState = { sessions: new Map(), pending: new Map() },
+  ) {
+    this.sessions = state.sessions;
+    this.pending = state.pending;
+    for (const rt of this.sessions.values()) rt.waitingForIdle = false;
+  }
+
+  async recoverAfterReload(): Promise<void> {
+    // A terminal event already admitted by the retired instance may still be in
+    // flight. Inspect the inherited state after its shared queue has settled.
+    await Promise.all([...this.sessions.keys()].map((id) => this.exclusive(id, async () => {
+      if (!this.disposed && !this.sessions.get(id)?.executing) this.requestContinuation(id);
+    })));
+  }
 
   private ownsLocation(location: GoalLocation): boolean {
-    return locationDirectory(location.directory) === locationDirectory(this.location.directory)
-      && location.workspaceID === this.location.workspaceID;
+    return goalLocationKey(location) === goalLocationKey(this.location);
   }
 
   /** Commands, tools and events share this queue so accounting snapshots cannot race. */
@@ -158,6 +179,7 @@ export class GoalRuntime {
     sessionID: string, text: string, description: string, purpose: string, goalId?: string,
     resume = true, delivery: "steer" | "queue" = "steer",
   ): Promise<boolean> {
+    if (this.disposed) return false;
     const attempt = (mode: "steer" | "queue") => this.session.synthetic({
       sessionID, text, description, delivery: mode, resume,
       metadata: { ocGoal: true, purpose, ...(goalId ? { goalId } : {}) },
@@ -165,6 +187,7 @@ export class GoalRuntime {
     try { await attempt(delivery); return true; }
     catch (error) {
       if (delivery === "steer") {
+        if (this.disposed) return false;
         try { await attempt("queue"); return true; }
         catch (fallback) { this.log(`steering failed for ${sessionID}: ${String(fallback)}`); }
       } else this.log(`steering failed for ${sessionID}: ${String(error)}`);
@@ -200,10 +223,15 @@ export class GoalRuntime {
     if (this.disposed || rt.waitingForIdle || rt.continuationPending || rt.stopped || rt.suppressed) return;
     rt.waitingForIdle = true;
     // Wait outside the queue: executing tools and terminal events must remain able to settle.
-    void this.session.wait({ sessionID }).then(() => this.exclusive(sessionID, async () => {
-      rt.waitingForIdle = false;
-      await this.continue(sessionID);
-    })).catch((error) => {
+    void this.session.wait({ sessionID }).then(() => {
+      if (this.disposed) return;
+      return this.exclusive(sessionID, async () => {
+        if (this.disposed) return;
+        rt.waitingForIdle = false;
+        await this.continue(sessionID);
+      });
+    }).catch((error) => {
+      if (this.disposed) return;
       rt.waitingForIdle = false;
       this.log(`idle check failed for ${sessionID}: ${String(error)}`);
     });
@@ -213,12 +241,14 @@ export class GoalRuntime {
     const rt = this.runtime(sessionID);
     if (this.disposed || !this.options.enabled || rt.executing || rt.continuationPending || rt.stopped || rt.suppressed || rt.inbox.size > 0) return;
     const info = await this.session.get({ sessionID });
+    if (this.disposed) return;
     rt.agent = info.agent ?? rt.agent;
     if (rt.agent === "plan") {
       rt.accounting.stopWallClock();
       return;
     }
     const goal = await this.store.getThreadGoal(sessionID);
+    if (this.disposed) return;
     if (!goal || goal.status !== "active") return;
     if (this.options.maxContinuationTurns > 0 && rt.continuationCount >= this.options.maxContinuationTurns) {
       const paused = await this.store.pauseActiveThreadGoal(sessionID);
@@ -388,7 +418,7 @@ export class GoalRuntime {
     // The event stream and plugin storage are global, but setup() runs per location.
     // Only the owning instance may charge usage or dispatch continuation for a session.
     const location = event.location ?? (await this.session.get({ sessionID })).location;
-    if (!this.ownsLocation(location)) return;
+    if (this.disposed || !this.ownsLocation(location)) return;
     return this.exclusive(sessionID, async () => {
       const rt = this.runtime(sessionID);
       switch (event.type) {
