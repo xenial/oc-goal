@@ -65,6 +65,8 @@ interface SessionRuntime {
   continuationCount: number;
   /** Set once a goal completes/blocks/pauses so we stop continuing. */
   stopped: boolean;
+  /** True between session.execution.started and its terminal event. */
+  executing: boolean;
 }
 
 export default Plugin.define({
@@ -89,6 +91,7 @@ export default Plugin.define({
           currentTurnAutomatic: false,
           continuationCount: 0,
           stopped: false,
+          executing: false,
         };
         sessions.set(sessionID, rt);
       }
@@ -280,9 +283,42 @@ export default Plugin.define({
       } as never);
     }
 
+    // Best-effort variant: a session that is busy (e.g. mid shell command) can
+    // reject a steer. Fall back to queue, and never let steering failure
+    // propagate to the caller — goal state is already persisted by this point.
+    async function sendInternalSafe(
+      sessionID: string,
+      text: string,
+      description: string,
+      delivery?: "steer" | "queue",
+    ): Promise<void> {
+      try {
+        await sendInternal(sessionID, text, description, delivery);
+      } catch (err) {
+        if (delivery === "steer") {
+          try {
+            await sendInternal(sessionID, text, description, "queue");
+            log(`session=${sessionID} steer rejected (busy); queued instead`);
+            return;
+          } catch (err2) {
+            log(`session=${sessionID} steering failed: ${String(err2)}`);
+            return;
+          }
+        }
+        log(`session=${sessionID} steering failed: ${String(err)}`);
+      }
+    }
+
     async function continueIfIdle(sessionID: string): Promise<void> {
       if (!opts.enabled) return;
       const rt = runtimeFor(sessionID);
+      // Never dispatch a continuation while the session is mid-execution
+      // (e.g. blocked waiting on a shell command). The automatic path only
+      // fires on session.idle, but the manual /goal path can arrive at any time.
+      if (rt.executing) {
+        log(`session=${sessionID} is executing; deferring goal continuation`);
+        return;
+      }
       const goal = await store.getThreadGoal(sessionID);
       if (!goal || goal.status !== "active") {
         rt.accounting.clearActiveGoal();
@@ -320,6 +356,11 @@ export default Plugin.define({
           const rt = runtimeFor(sessionID);
 
           switch (type) {
+            case "session.execution.started": {
+              rt.executing = true;
+              break;
+            }
+
             case "session.step.started": {
               // New model step => treat as a new goal turn.
               rt.turnSeq += 1;
@@ -365,7 +406,7 @@ export default Plugin.define({
                   "keep_active",
                 );
                 if (res?.flippedToBudgetLimited) {
-                  await sendInternal(
+                  await sendInternalSafe(
                     sessionID,
                     budgetLimitPrompt(res.goal),
                     "Goal reached its token budget",
@@ -379,6 +420,7 @@ export default Plugin.define({
             }
 
             case "session.execution.succeeded": {
+              rt.executing = false;
               if (rt.currentTurnId) {
                 await accountTurnProgress(sessionID, rt.currentTurnId, "active_only", "clear_active");
                 rt.accounting.finishTurn(rt.currentTurnId);
@@ -389,6 +431,7 @@ export default Plugin.define({
             }
 
             case "session.execution.interrupted": {
+              rt.executing = false;
               if (rt.currentTurnId) {
                 await accountTurnProgress(sessionID, rt.currentTurnId, "active_only", "clear_active");
                 rt.accounting.interruptTurn(rt.currentTurnId);
@@ -399,6 +442,7 @@ export default Plugin.define({
             }
 
             case "session.execution.failed": {
+              rt.executing = false;
               const err = data.error as { type?: string; message?: string } | undefined;
               const msg = `${err?.type ?? ""} ${err?.message ?? ""}`.toLowerCase();
               const usageLimited = /usage.?limit|quota|insufficient/.test(msg);
@@ -504,8 +548,9 @@ export default Plugin.define({
       rt.accounting.markIdleGoalActive(goal.goalId);
       void pushStatus(sessionID);
       // If a turn is running and the objective changed, inject steering.
+      // Best-effort: the session may be mid shell command; queue as fallback.
       if (previousObjective !== null && previousObjective !== goal.objective && rt.currentTurnId) {
-        await sendInternal(sessionID, objectiveUpdatedPrompt(goal), "Goal objective updated", "steer");
+        await sendInternalSafe(sessionID, objectiveUpdatedPrompt(goal), "Goal objective updated", "steer");
       } else if (!rt.currentTurnId) {
         await continueIfIdle(sessionID);
       }
